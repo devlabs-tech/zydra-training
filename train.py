@@ -1,266 +1,153 @@
-import argparse
 import json
+import re
 from pathlib import Path
 
-import torch
-from torch.utils.data import DataLoader, Dataset
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors, trainers
-from transformers import PreTrainedTokenizerFast
-
-from modeling_zydra import ZydraConfig, ZydraForCausalLM
+DATASHEET_DIR = Path("datasheet")
+OUTPUT = Path("data/chat_train_plain.jsonl")
 
 
-class TokenBlocks(Dataset):
-    def __init__(self, texts, tokenizer, block_size, pad_token_id):
-        self.block_size = block_size
-        self.pad_token_id = pad_token_id
-        self.blocks = []
-
-        for text in texts:
-            token_ids = tokenizer(
-                text,
-                add_special_tokens=True,
-                truncation=False,
-            )["input_ids"]
-
-            if len(token_ids) < 2:
-                continue
-
-            for start in range(0, len(token_ids) - 1, block_size):
-                chunk = token_ids[start : start + block_size + 1]
-                if len(chunk) < 2:
-                    continue
-
-                inputs = chunk[:-1]
-                labels = chunk[1:]
-
-                if len(inputs) < block_size:
-                    pad_len = block_size - len(inputs)
-                    inputs = inputs + [pad_token_id] * pad_len
-                    labels = labels + [-100] * pad_len
-
-                self.blocks.append(
-                    (
-                        torch.tensor(inputs, dtype=torch.long),
-                        torch.tensor(labels, dtype=torch.long),
-                    )
-                )
-
-    def __len__(self):
-        return len(self.blocks)
-
-    def __getitem__(self, index):
-        return self.blocks[index]
+def parse_qa_blocks(text):
+    """Parse .txt: blok pertanyaan/jawaban dipisah baris kosong."""
+    rows = []
+    blocks = re.split(r"\n\s*\n", text.strip())
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        q = lines[0]
+        a = " ".join(lines[1:]).strip()
+        if not q or not a:
+            continue
+        if not q.endswith("?"):
+            q += "?"
+        rows.append(f"{q}\n{a}")
+    return rows
 
 
-def load_texts(path, data_format):
-    if data_format == "text":
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            raise ValueError(f"No training text found in {path}.")
-        return [text]
+def parse_jsonl(text):
+    """
+    Parse .jsonl. Mendukung:
+      - {"text": "..."}
+      - {"instruction": "...", "output": "...", "input": "..."}
+      - {"messages": [{"role": "user", ...}, {"role": "assistant", ...}]}
+    """
+    rows = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f"  [WARN] baris {line_number}: JSON invalid ({e})")
+            continue
+        if not isinstance(record, dict):
+            continue
 
-    texts = []
-    with path.open(encoding="utf-8") as dataset_file:
-        for line_number, line in enumerate(dataset_file, start=1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ValueError(f"Invalid JSON on line {line_number}: {error}") from error
-            text = record.get("text")
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError(f"Line {line_number} must contain a non-empty string field 'text'.")
-            texts.append(text.strip())
-    if not texts:
-        raise ValueError(f"No training texts found in {path}.")
-    return texts
+        # Format 1: {"text": "..."}
+        if isinstance(record.get("text"), str) and record["text"].strip():
+            rows.append(record["text"].strip())
+            continue
 
-
-def load_text_directory(directory):
-    if not directory.is_dir():
-        raise ValueError(f"Training data directory does not exist: {directory}")
-
-    files = sorted(path for path in directory.rglob("*.txt") if path.is_file())
-    if not files:
-        raise ValueError(f"No .txt training files found under {directory}.")
-
-    texts = []
-    for path in files:
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            raise ValueError(f"Training text file is empty: {path}")
-        texts.append(text)
-        print(f"Loaded {path}")
-    return texts
-
-
-def build_toy_train(texts, output_path):
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as dataset_file:
-        for text in texts:
-            dataset_file.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
-    print(f"Built training dataset {output_path} from {len(texts)} text files.")
-
-
-def train_tokenizer(texts, vocab_size, output_dir):
-    special_tokens = ["[PAD]", "[UNK]", "[BOS]", "[EOS]"]
-    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = decoders.ByteLevel()
-    tokenizer.train_from_iterator(
-        texts,
-        trainers.BpeTrainer(
-            vocab_size=vocab_size,
-            min_frequency=2,
-            special_tokens=special_tokens,
-            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-        ),
-    )
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single="[BOS] $A [EOS]",
-        special_tokens=[
-            ("[BOS]", tokenizer.token_to_id("[BOS]")),
-            ("[EOS]", tokenizer.token_to_id("[EOS]")),
-        ],
-    )
-    fast_tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        pad_token="[PAD]",
-        unk_token="[UNK]",
-        bos_token="[BOS]",
-        eos_token="[EOS]",
-    )
-    fast_tokenizer.save_pretrained(output_dir)
-    return fast_tokenizer
-
-
-def sample_generation(model, tokenizer, device, prompt, max_new_tokens=40):
-    model.eval()
-    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)["input_ids"].to(device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.95,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+        # Format 2: {"instruction": "...", "output": "..."}
+        inst = (
+            record.get("instruction")
+            or record.get("prompt")
+            or record.get("question")
+            or ""
         )
-    text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    model.train()
-    return text
+        inp = record.get("input") or ""
+        out = (
+            record.get("output")
+            or record.get("response")
+            or record.get("answer")
+            or ""
+        )
+        if isinstance(inst, str) and inst.strip() and isinstance(out, str) and out.strip():
+            q = inst.strip()
+            if isinstance(inp, str) and inp.strip():
+                q = f"{q} {inp.strip()}"
+            a = out.strip()
+            if not q.endswith("?"):
+                q += "?"
+            rows.append(f"{q}\n{a}")
+            continue
+
+        # Format 3: {"messages": [...]}
+        messages = record.get("messages")
+        if isinstance(messages, list):
+            for i in range(len(messages) - 1):
+                m1 = messages[i]
+                m2 = messages[i + 1]
+                if not isinstance(m1, dict) or not isinstance(m2, dict):
+                    continue
+                if m1.get("role") == "user" and m2.get("role") == "assistant":
+                    q = (m1.get("content") or "").strip()
+                    a = (m2.get("content") or "").strip()
+                    if q and a:
+                        if not q.endswith("?"):
+                            q += "?"
+                        rows.append(f"{q}\n{a}")
+    return rows
+
+
+def load_file(path):
+    text = path.read_text(encoding="utf-8-sig").strip()
+    if not text:
+        return []
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        return parse_jsonl(text)
+    elif suffix == ".txt":
+        return parse_qa_blocks(text)
+    return []
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Zydra from random weights on a text or JSONL corpus.")
-    data_source = parser.add_mutually_exclusive_group()
-    data_source.add_argument("--data", type=Path, help="Path to one text or JSONL training file.")
-    data_source.add_argument(
-        "--data-dir",
-        type=Path,
-        help="Directory containing .txt files; defaults to train/ and searches subdirectories.",
+    if not DATASHEET_DIR.is_dir():
+        raise SystemExit(f"Folder tidak ditemukan: {DATASHEET_DIR}")
+
+    files = sorted(
+        p for p in DATASHEET_DIR.rglob("*")
+        if p.is_file() and p.suffix.lower() in {".txt", ".jsonl"}
     )
-    parser.add_argument("--data-format", choices=("jsonl", "text"), default="jsonl")
-    parser.add_argument("--output", type=Path, default=Path("output/zydra-v2-hf"))
-    parser.add_argument("--vocab-size", type=int, default=512)
-    parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--layers", type=int, default=4)
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--kv-heads", type=int, default=2)
-    parser.add_argument("--intermediate-size", type=int, default=704)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--seed", type=int, default=1337)
-    args = parser.parse_args()
+    if not files:
+        raise SystemExit(f"Tidak ada file .txt atau .jsonl di {DATASHEET_DIR}")
 
-    if args.heads < 1 or args.kv_heads < 1 or args.hidden_size % args.heads != 0:
-        parser.error("--hidden-size must be divisible by positive --heads")
-    if args.heads % args.kv_heads != 0:
-        parser.error("--heads must be divisible by --kv-heads")
-    if args.block_size < 2 or args.epochs < 1:
-        parser.error("--block-size must be >= 2 and --epochs must be >= 1")
+    seen = set()
+    all_rows = []
+    for path in files:
+        try:
+            rows = load_file(path)
+        except Exception as e:
+            print(f"[SKIP] {path.name}: {e}")
+            continue
 
-    torch.manual_seed(args.seed)
-    if args.data is not None:
-        data_path = args.data
-        texts = load_texts(data_path, args.data_format)
-        print(f"Loaded {data_path} ({len(texts)} documents)")
-    else:
-        data_directory = args.data_dir or Path("train")
-        source_texts = load_text_directory(data_directory)
-        dataset_path = Path("data/toy_train.jsonl")
-        build_toy_train(source_texts, dataset_path)
-        texts = load_texts(dataset_path, "jsonl")
-        print(f"Loaded {len(texts)} documents from {dataset_path}.")
-    args.output.mkdir(parents=True, exist_ok=True)
-    tokenizer = train_tokenizer(texts, args.vocab_size, args.output)
-    training_data = TokenBlocks(texts, tokenizer, args.block_size, tokenizer.pad_token_id)
-    if not training_data:
-        raise ValueError("The corpus is too small; add more text or reduce --block-size.")
+        if not rows:
+            print(f"[SKIP] {path.name}: tidak ada baris valid")
+            continue
 
-    print(f"Training blocks: {len(training_data)}")
+        added = 0
+        for r in rows:
+            if r in seen:
+                continue
+            seen.add(r)
+            all_rows.append(r)
+            added += 1
 
-    config = ZydraConfig(
-        vocab_size=len(tokenizer),
-        max_position_embeddings=args.block_size,
-        hidden_size=args.hidden_size,
-        intermediate_size=args.intermediate_size,
-        num_hidden_layers=args.layers,
-        num_attention_heads=args.heads,
-        num_key_value_heads=args.kv_heads,
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        rms_norm_eps=1e-5,
-        rope_theta=10000.0,
-        tie_word_embeddings=False,
-    )
-    model = ZydraForCausalLM(config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.train()
+        ext = path.suffix.lower().lstrip(".")
+        print(f"[OK] {path.name} ({ext}): {added} baris unik dari {len(rows)}")
 
-    loader = DataLoader(training_data, batch_size=args.batch_size, shuffle=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    total_steps = len(loader) * args.epochs
-    step = 0
-    for epoch in range(args.epochs):
-        total_loss = 0.0
-        for inputs, labels in loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            loss = model(input_ids=inputs, labels=labels).loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            total_loss += loss.item()
-            step += 1
-            if step % 50 == 0 or step == total_steps:
-                print(f"step {step}/{total_steps} loss {loss.item():.4f}")
-        print(f"epoch {epoch + 1}/{args.epochs} mean_loss {total_loss / len(loader):.4f}")
+    if not all_rows:
+        raise SystemExit("Tidak ada baris valid ditemukan.")
 
-    model.config.architectures = ["ZydraForCausalLM"]
-    model.save_pretrained(args.output, safe_serialization=True)
-    tokenizer.save_pretrained(args.output)
-    print(f"Saved fresh-from-scratch Zydra checkpoint to {args.output}")
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT.open("w", encoding="utf-8") as f:
+        for r in all_rows:
+            f.write(json.dumps({"text": r}, ensure_ascii=False) + "\n")
 
-    print("\n--- Sample generations (sanity check) ---")
-    prompts = [
-        "Pertanyaan: Berapa hasil 14 + 14?\nJawaban:",
-        "Pertanyaan: siapa namamu\nJawaban:",
-        "Pertanyaan: apa kabar\nJawaban:",
-        "Pertanyaan: Berapa hasil 7 x 8?\nJawaban:",
-        "Pertanyaan: siapa developer mu?\nJawaban:",
-    ]
-    for prompt in prompts:
-        generated = sample_generation(model, tokenizer, device, prompt)
-        print(f"PROMPT: {prompt!r}\nOUTPUT: {generated!r}\n")
+    print(f"\nTotal unik: {len(all_rows)} baris")
+    print(f"Output    : {OUTPUT}")
 
 
 if __name__ == "__main__":

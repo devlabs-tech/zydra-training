@@ -39,21 +39,20 @@ Untuk membuat ulang korpus sintetis bawaan dan melatih proof of concept:
 
 ```bash
 python3 dedupe_dataset.py
-python3 augment_dataset.py
 
 python3 train.py \
   --data data/chat_train_plain_augmented.jsonl \
   --output output/zydra-v2-hf \
-  --vocab-size 512 \
-  --block-size 128 \
+  --vocab-size 1024 \
+  --block-size 256 \
   --layers 4 \
   --hidden-size 256 \
   --heads 4 \
   --kv-heads 2 \
   --intermediate-size 704 \
   --batch-size 8 \
-  --epochs 8 \
-  --learning-rate 3e-4 \
+  --epochs 20 \
+  --learning-rate 5e-4 \
   --seed 1337
 ```
 

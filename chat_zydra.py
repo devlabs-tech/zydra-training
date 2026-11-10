@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import torch
 from transformers import PreTrainedTokenizerFast
@@ -10,6 +11,10 @@ def main():
     parser = argparse.ArgumentParser(description="Interactive terminal chat with Zydra.")
     parser.add_argument("--model", default="output/zydra-v2-hf")
     parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="0 = greedy, >0 = sampling")
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--repetition-penalty", type=float, default=1.15)
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
@@ -21,11 +26,13 @@ def main():
     context_limit = model.config.max_position_embeddings
     history = ""
 
-    print("Zydra CLI siap. Ketik pertanyaan; ketik 'keluar' atau '/exit' untuk berhenti.")
+    os.system("clear" if os.name == "posix" else "cls")
+    print("Zydra CLI")
     print("Catatan: model masih eksperimen dan dapat memberi jawaban keliru.")
+
     while True:
         try:
-            user_text = input("Anda> ").strip()
+            user_text = input("Kamu> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -38,9 +45,10 @@ def main():
         if not user_text:
             continue
 
-        prompt = f"{history}Pertanyaan: {user_text}\nJawaban:"
+        question = user_text if user_text.endswith("?") else user_text + "?"
+        prompt = f"{history}{question}\n"
         token_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        token_ids = token_ids[-(context_limit - 1) :]
+        token_ids = token_ids[-(context_limit - 1):]
         if tokenizer.bos_token_id is not None:
             token_ids.insert(0, tokenizer.bos_token_id)
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
@@ -49,18 +57,29 @@ def main():
             print("Zydra> Konteks penuh. Ketik /reset untuk memulai percakapan baru.")
             continue
 
-        with torch.inference_mode():
-            output_ids = model.generate(
-                input_ids=input_ids,
-                max_new_tokens=generation_limit,
-                do_sample=False,
-                repetition_penalty=1.15,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
+        gen_kwargs = dict(
+            input_ids=input_ids,
+            max_new_tokens=generation_limit,
+            repetition_penalty=args.repetition_penalty,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        if args.temperature > 0:
+            gen_kwargs.update(
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
             )
-        answer = tokenizer.decode(output_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
+        else:
+            gen_kwargs.update(do_sample=False)
+
+        with torch.inference_mode():
+            output_ids = model.generate(**gen_kwargs)
+
+        raw = tokenizer.decode(output_ids[0, input_ids.shape[1]:], skip_special_tokens=True)
+        answer = raw.strip().split("\n")[0].strip()
         print(f"Zydra> {answer or '[tidak ada keluaran]'}")
-        history = f"{history}Pertanyaan: {user_text}\nJawaban: {answer}\n"
+        history = f"{history}{question}\n{answer}\n"
 
 
 if __name__ == "__main__":
