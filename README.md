@@ -38,9 +38,11 @@ Jika menggunakan `--data` untuk file teks atau JSONL, pelatihan membaca file ter
 Untuk membuat ulang korpus sintetis bawaan dan melatih proof of concept:
 
 ```bash
-python3 data/generate_toy_corpus.py
+python3 dedupe_dataset.py
+python3 augment_dataset.py
+
 python3 train.py \
-  --data data/chat_train_v2.jsonl \
+  --data data/chat_train_plain_augmented.jsonl \
   --output output/zydra-v2-hf \
   --vocab-size 512 \
   --block-size 128 \
@@ -50,7 +52,7 @@ python3 train.py \
   --kv-heads 2 \
   --intermediate-size 704 \
   --batch-size 8 \
-  --epochs 12 \
+  --epochs 8 \
   --learning-rate 3e-4 \
   --seed 1337
 ```

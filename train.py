@@ -11,24 +11,46 @@ from modeling_zydra import ZydraConfig, ZydraForCausalLM
 
 
 class TokenBlocks(Dataset):
-    def __init__(self, texts, tokenizer, block_size):
-        token_ids = []
-        for text in texts:
-            token_ids.extend(tokenizer(text, add_special_tokens=True)["input_ids"])
+    def __init__(self, texts, tokenizer, block_size, pad_token_id):
+        self.block_size = block_size
+        self.pad_token_id = pad_token_id
+        self.blocks = []
 
-        self.blocks = [
-            torch.tensor(token_ids[start : start + block_size + 1], dtype=torch.long)
-            for start in range(0, len(token_ids) - block_size, block_size)
-        ]
+        for text in texts:
+            token_ids = tokenizer(
+                text,
+                add_special_tokens=True,
+                truncation=False,
+            )["input_ids"]
+
+            if len(token_ids) < 2:
+                continue
+
+            for start in range(0, len(token_ids) - 1, block_size):
+                chunk = token_ids[start : start + block_size + 1]
+                if len(chunk) < 2:
+                    continue
+
+                inputs = chunk[:-1]
+                labels = chunk[1:]
+
+                if len(inputs) < block_size:
+                    pad_len = block_size - len(inputs)
+                    inputs = inputs + [pad_token_id] * pad_len
+                    labels = labels + [-100] * pad_len
+
+                self.blocks.append(
+                    (
+                        torch.tensor(inputs, dtype=torch.long),
+                        torch.tensor(labels, dtype=torch.long),
+                    )
+                )
 
     def __len__(self):
         return len(self.blocks)
 
     def __getitem__(self, index):
-        block = self.blocks[index]
-        inputs = block[:-1]
-        # Causal language models shift labels internally during loss calculation.
-        return inputs, inputs
+        return self.blocks[index]
 
 
 def load_texts(path, data_format):
@@ -114,6 +136,24 @@ def train_tokenizer(texts, vocab_size, output_dir):
     return fast_tokenizer
 
 
+def sample_generation(model, tokenizer, device, prompt, max_new_tokens=40):
+    model.eval()
+    input_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)["input_ids"].to(device)
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.95,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    model.train()
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Zydra from random weights on a text or JSONL corpus.")
     data_source = parser.add_mutually_exclusive_group()
@@ -149,7 +189,7 @@ def main():
     if args.data is not None:
         data_path = args.data
         texts = load_texts(data_path, args.data_format)
-        print(f"Loaded {data_path}")
+        print(f"Loaded {data_path} ({len(texts)} documents)")
     else:
         data_directory = args.data_dir or Path("train")
         source_texts = load_text_directory(data_directory)
@@ -159,9 +199,11 @@ def main():
         print(f"Loaded {len(texts)} documents from {dataset_path}.")
     args.output.mkdir(parents=True, exist_ok=True)
     tokenizer = train_tokenizer(texts, args.vocab_size, args.output)
-    training_data = TokenBlocks(texts, tokenizer, args.block_size)
+    training_data = TokenBlocks(texts, tokenizer, args.block_size, tokenizer.pad_token_id)
     if not training_data:
         raise ValueError("The corpus is too small; add more text or reduce --block-size.")
+
+    print(f"Training blocks: {len(training_data)}")
 
     config = ZydraConfig(
         vocab_size=len(tokenizer),
@@ -207,6 +249,18 @@ def main():
     model.save_pretrained(args.output, safe_serialization=True)
     tokenizer.save_pretrained(args.output)
     print(f"Saved fresh-from-scratch Zydra checkpoint to {args.output}")
+
+    print("\n--- Sample generations (sanity check) ---")
+    prompts = [
+        "Pertanyaan: Berapa hasil 14 + 14?\nJawaban:",
+        "Pertanyaan: siapa namamu\nJawaban:",
+        "Pertanyaan: apa kabar\nJawaban:",
+        "Pertanyaan: Berapa hasil 7 x 8?\nJawaban:",
+        "Pertanyaan: siapa developer mu?\nJawaban:",
+    ]
+    for prompt in prompts:
+        generated = sample_generation(model, tokenizer, device, prompt)
+        print(f"PROMPT: {prompt!r}\nOUTPUT: {generated!r}\n")
 
 
 if __name__ == "__main__":
